@@ -1,0 +1,26 @@
+# CVMM-MPPI hyperparameters.
+# `dt` is intentionally absent from the `mppi` block below: it is not a field of
+# MPPIConfig, and mppi_policy.py sets it directly on the dynamics/objective from
+# the simulator's time_step (0.25s) at lazy-init time.
+device: "cuda:0"
+
+mppi:
+  mppi_mode: "simple"      
+  sampling_method: "random"  # avoids the ghalton/bspline knot sampling path
+  num_samples: 2000
+  horizon: 8                # 8 steps * 0.25s = 2s lookahead
+  lambda_: 0.1
+  u_min: [-0.95, -1.047]     # [v_min, r_min]; r is a per-step heading increment (rad)
+  u_max: [0.95, 1.047]       # r_max = 60 deg/step
+  noise_sigma: [[0.3, 0.0], [0.0, 0.3]]
+  u_per_command: 1
+  sample_null_action: true
+  filter_u: false
+  device: "cuda:0"
+
+weights:
+  w_goal: 1.0
+  w_human: 100.0
+  w_wall: 100.0
+  buffer: 0.10
+  collision_cost: 1000000.0

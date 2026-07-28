@@ -58,8 +58,16 @@ def get_scenario_name(args, env_config_file, policy_config, env, robot):
         if not os.path.isdir(save_dir):
             os.makedirs(save_dir)
         scenario_name = 'orca_plus_{:}_{:}'.format(env_id, args.num_humans)
+    elif args.policy == 'mppi':
+        save_dir = os.path.join(os.getcwd(), 'results_mppi', env_id)
+        if not os.path.isdir(save_dir):
+            os.makedirs(save_dir)
+        scenario_name = 'mppi_{:}_{:}'.format(env_id, args.num_humans)
     else:
         scenario_name = 'null'
+        save_dir = os.path.join(os.getcwd(), 'results_null', env_id)
+        if not os.path.isdir(save_dir):
+            os.makedirs(save_dir)
 
 
     return scenario_name, env_id, save_dir
@@ -345,3 +353,9 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+
+# python run_tro.py --policy campc \
+#   --env_config sicnav/configs/env.config \
+#   --policy_config sicnav/configs/policy.config
