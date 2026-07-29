@@ -120,3 +120,18 @@ Details regarding the training of human prediction models iMID and JMID can be f
 ## Contributors
 
 This repository is primarily developed by [Sepehr Samavi](github.com/sepsamavi) (`sicnav`, `sicnav_diffusion` and `crowd_sim_plus`), [James R. Han](github.com/james-r-han) (`RL_nav` and `crowd_sim_plus`), [Anthony Lem](github.com/anthonyjlem) (`JMID`) and Fumiaki Sato (`JMID`).
+
+
+
+# INSTALL
+
+```
+conda create -n sicnav python=3.8.13 && conda activate sicnav
+cd safe-interactive-crowdnav
+pip install -e .
+pip install -r requirements.txt
+
+# python-rvo2 — NOT in requirements, this is the one that eats time
+git clone https://github.com/sybrenstuvel/Python-RVO2.git
+cd Python-RVO2 && python setup.py build && python setup.py install && cd ..
+```
