@@ -1,0 +1,91 @@
+# ORCA-interaction-aware MPPI hyperparameters.
+# `dt`/`device`/`goal`/`start` are intentionally absent from the blocks below:
+# dt is not read by mppi.py itself (dynamics/objective/predictor each own dt,
+# set from the simulator's time_step at lazy-init time), and device/goal/start
+# are overwritten every predict() call from the env's actual state.
+#
+# `mppi:` below must contain ONLY fields of MPPIConfig
+# (sicnav/policy/mppi_orca_core/planner/mppi.py) -- it's passed straight into
+# MPPIPlanner(**mppi_cfg), which raises on unexpected keys.
+
+mppi:
+  mppi_mode: "simple"        # matches mppi.yaml's choice (avoids ghalton/bspline path)
+  sampling_method: "random"
+  compute_cost_once: true    # required: only this path invokes human_predictor/kmeans
+  num_samples: 2000
+  horizon: 8                 # 8 steps * 0.25s = 2s lookahead
+  n_clusters: 12              # cluster count for the ORCA-conditioning reduction
+  lambda_: 0.1
+  u_min: [-0.95, -1.047]      # [v_min, r_min]; r is a per-step heading increment (rad)
+  u_max: [0.95, 1.047]        # r_max = 60 deg/step (matches policy.config max_rot_degrees)
+  noise_sigma: [[0.3, 0.0], [0.0, 0.3]]
+  u_per_command: 1
+  sample_null_action: true
+  filter_u: false
+
+obstacles:
+  print_time: false
+  use_gaussian_batch: true
+  N_monte_carlo: 3000
+  # robot radius (0.25) + human radius (0.30) + buffer (0.10), matching the
+  # same buffer convention as weights.wall_buffer / the vanilla CVMM policy's
+  # human margin -- NOT 0.4, which undersizes actual contact distance and
+  # under-detects risk right where it matters.
+  integral_radius: 0.65
+  sample_bound: 6.0
+  isotropic_sigma: 0.15
+  # 0.5 + a 1e6 penalty caused a frozen-robot failure mode: cost_horizon is
+  # SUMMED over the T=8 horizon, so a trajectory that merely grazes >0.5 prob
+  # at ONE timestep eats the full penalty once, making "stay still" (which
+  # never grazes anything) cheaper than any trajectory that threads the
+  # bottleneck -- in a corridor this narrow essentially every forward path
+  # grazes 0.5 briefly. Raised to 0.75 (only fire on genuine high-confidence
+  # risk) and penalty dropped an order of magnitude (still dominant at
+  # lambda_=0.1 vs O(1-100) goal/wall costs, just not so extreme that one
+  # momentary graze outweighs completing the trip).
+  # Calibration note (see mppi_orca_objective.py / this file's history): a
+  # manual sweep across {0.5,0.75,0.85,0.9} x {20k,50k,100k,1e6} x
+  # {50,100,2000} found a real safety/conservatism tradeoff, not a single
+  # clean optimum -- tighter settings collide (e.g. 0.9/20000/50 got 5
+  # collisions on test_case 1), looser settings freeze the robot (0.75/1e5/2k
+  # froze on 4/5 cases). This setting was the safest found (0 collisions
+  # across test_cases 0-4) at the cost of freezing on ~40-60% of cases --
+  # matching where even the already-validated vanilla CVMM-MPPI policy
+  # (--policy mppi) also freezes (test_case 1, lambda_=0.1 + sample_null_action
+  # is a known frozen-robot-prone combination independent of this risk term).
+  # A proper hyperparameter sweep (or revisiting summing risk cost
+  # undiscounted over the full horizon) is follow-up work, not done here.
+  hard_cp_constraint: 0.85
+  soft_cp_constraint: 0.2
+  hard_collision_penalty: 50000.0
+  coll_prob_weight: 100.0
+  orca_cov_scale: 0.1        # inert in the isotropic MC path we always hit --
+                              # see mppi_orca_objective.py __init__ comment;
+                              # isotropic_sigma above is the real spread knob.
+
+# ORCA parameters for the model this policy has of the humans -- mirrors
+# policy.config's [humans] section (the ORCA assumption SICNav-np/campc uses),
+# so the nominal (zero-uncertainty) comparison is apples-to-apples.
+orca:
+  neighbor_dist: 10.0
+  max_neighbors: 10
+  time_horizon: 2.5
+  time_horizon_obst: 1.50
+  radius: 0.3                # assumed robot radius in the ORCA sim
+  safety_space: 0.01
+  max_speed: 0.5              # matches policy.config [mpc_env] human_v_max_assumption
+
+# Uncertainty dial over the interaction model: persistent per-(cluster
+# representative, human) draws, held fixed across the MPC horizon (see
+# ORCAPredictor docstring for why -- receding-horizon replanning absorbs
+# per-step noise by construction). All zero/one here = nominal case.
+uncertainty:
+  angle_bias_std: 0.0         # rad, std of goal-direction bias
+  speed_scale_std: 0.0        # std of multiplicative speed bias
+  reciprocity_alpha: 1.0      # 1 = fully reciprocal, 0 = human ignores robot
+
+weights:
+  w_goal: 1.0
+  w_wall: 100.0
+  wall_buffer: 0.10
+  wall_collision_cost: 1000000.0

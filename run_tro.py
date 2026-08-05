@@ -63,6 +63,11 @@ def get_scenario_name(args, env_config_file, policy_config, env, robot):
         if not os.path.isdir(save_dir):
             os.makedirs(save_dir)
         scenario_name = 'mppi_{:}_{:}'.format(env_id, args.num_humans)
+    elif args.policy == 'mppi_orca':
+        save_dir = os.path.join(os.getcwd(), 'results_mppi_orca', env_id)
+        if not os.path.isdir(save_dir):
+            os.makedirs(save_dir)
+        scenario_name = 'mppi_orca_{:}_{:}'.format(env_id, args.num_humans)
     else:
         scenario_name = 'null'
         save_dir = os.path.join(os.getcwd(), 'results_null', env_id)
