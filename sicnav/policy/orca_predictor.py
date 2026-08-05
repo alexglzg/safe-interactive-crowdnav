@@ -105,27 +105,43 @@ class ORCAPredictor:
 
         out = np.zeros((C, T, n, 4), dtype=np.float64)
 
+        eps = 1e-3
         for c in range(C):
             hum_pos = self._human_pos0.copy()
             hum_vel = self._human_vel0.copy()
-            prev_robot_pos = samples_np[c, 0]
 
             for t in range(T):
                 robot_pos = samples_np[c, t]
-                robot_vel = (robot_pos - prev_robot_pos) / self.dt if t > 0 else np.zeros(2)
-                prev_robot_pos = robot_pos
 
+                # Position-only, matching the reference (_rollout_one_sample
+                # in orca_mppi_cond_node.py): agent 0's velocity is
+                # deliberately left alone (~0, since it never gets a
+                # setAgentPrefVelocity call either) -- only its POSITION
+                # drives the humans' avoidance geometry there. Setting a
+                # real finite-differenced velocity here (as an earlier
+                # version of this file did) makes every human react more
+                # defensively to every rollout than the reference ever did,
+                # and was the primary cause of a frozen-robot regression.
                 sim.setAgentPosition(0, tuple(robot_pos))
-                sim.setAgentVelocity(0, tuple(robot_vel))
 
                 pref_vels = np.zeros((n, 2))
                 for i in range(n):
-                    goal_vec = self._human_goals[i] - hum_pos[i]
-                    dist = np.linalg.norm(goal_vec)
-                    direction = goal_vec / dist if dist > 1e-6 else np.zeros(2)
-                    theta = np.arctan2(direction[1], direction[0]) + angle_bias[c, i]
-                    speed = self.human_max_speed * speed_scale[c, i]
-                    pref_vels[i] = speed * np.array([np.cos(theta), np.sin(theta)])
+                    # Reference formula (orca_mppi_cond_node.py
+                    # _rollout_one_sample): raw goal vector, capped at
+                    # vmax-eps if beyond one step's reach, else used AS-IS
+                    # (slows down approaching the goal instead of
+                    # overshooting/oscillating -- this gym's CV-extrapolated
+                    # goal is often close, so the clamp matters). angle_bias
+                    # rotates the vector (magnitude-preserving, so it doesn't
+                    # disturb the distance-based branch) and speed_scale
+                    # scales vmax; both reduce to the reference exactly at
+                    # (angle_bias=0, speed_scale=1).
+                    raw_vel = self._human_goals[i] - hum_pos[i]
+                    dist = np.linalg.norm(raw_vel)
+                    theta = np.arctan2(raw_vel[1], raw_vel[0]) + angle_bias[c, i]
+                    rot_vel = dist * np.array([np.cos(theta), np.sin(theta)])
+                    vmax = self.human_max_speed * speed_scale[c, i]
+                    pref_vels[i] = (rot_vel / dist * (vmax - eps)) if dist > (vmax - eps) else rot_vel
 
                     sim.setAgentPosition(i + 1, tuple(hum_pos[i]))
                     sim.setAgentVelocity(i + 1, tuple(hum_vel[i]))
@@ -171,18 +187,21 @@ class ORCAPredictor:
             if self._static_obs:
                 sim.processObstacles()
 
+            # +0.01 fixed margin matches the reference (_init_worker in
+            # orca_mppi_cond_node.py, and orca.py/orca_plus.py elsewhere in
+            # this codebase) exactly -- radius + 0.01 + safety_space.
             if with_robot:
                 sim.addAgent(
                     (0.0, 0.0), self.neighbor_dist, self.max_neighbors,
                     self.time_horizon, self.time_horizon_obst,
-                    self.robot_radius + self.safety_space, self.human_max_speed,
+                    self.robot_radius + 0.01 + self.safety_space, self.human_max_speed,
                     (0.0, 0.0),
                 )
             for i in range(self.n_humans):
                 sim.addAgent(
                     (0.0, 0.0), self.neighbor_dist, self.max_neighbors,
                     self.time_horizon, self.time_horizon_obst,
-                    self._human_radii[i] + self.safety_space, self.human_max_speed,
+                    self._human_radii[i] + 0.01 + self.safety_space, self.human_max_speed,
                     (0.0, 0.0),
                 )
             setattr(self, cache_attr, sim)

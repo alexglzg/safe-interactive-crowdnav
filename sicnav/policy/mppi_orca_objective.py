@@ -60,6 +60,7 @@ class MPPIORCAObjective(ObjectiveFunctionsClass):
         self.last_predicted_humans = None
         self.last_human_cluster_labels = None
         self.last_human_cluster_center_idx = None
+        self.last_frac_exceed_hard = None  # diagnostic, see calculate_bound_dyn_cost
 
         self.set_goal(*cfg["goal"])
 
@@ -113,6 +114,11 @@ class MPPIORCAObjective(ObjectiveFunctionsClass):
         # made configurable and matched in magnitude to that hard wall
         # penalty so the planner doesn't treat human contact as far cheaper
         # than wall contact.
+        # DIAGNOSTIC (temporary, per user request): fraction of (cluster,
+        # timestep) pairs whose predicted collision probability exceeds the
+        # hard threshold -- read back by the policy adapter after command().
+        self.last_frac_exceed_hard = (coll_prob > self.hard_cp_constraint).float().mean().item()
+
         dyn_cost = torch.where(coll_prob > self.hard_cp_constraint, self.hard_collision_penalty, 0.)
         dyn_cost += coll_prob * self.coll_prob_weight
         return dyn_cost

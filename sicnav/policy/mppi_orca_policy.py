@@ -55,6 +55,7 @@ class MPPIORCAPolicy(Policy):
         self.priviledged_info = False
         self.planner = None
         self.mpc_env = _MpcEnvStub()
+        self._tick = 0
         self.all_x_val = []
         self.all_x_goals = []
 
@@ -125,9 +126,32 @@ class MPPIORCAPolicy(Policy):
         u, states_xy, cost_total = self.planner.command(robot)
         u = u.detach().cpu().numpy()
 
+        self._log_diagnostics()
+
         self._record_horizon(M, states_xy, cost_total)
 
         return ActionRot(float(u[0]), float(u[1]))
+
+    def _log_diagnostics(self):
+        # Temporary diagnostic (per user request while debugging frozen-robot
+        # behavior): per tick, fraction of (cluster, timestep) predictions
+        # exceeding hard_cp_constraint, and whether the highest-weighted
+        # sample is the null (braking) action -- index K-1 under
+        # sample_null_action, per _compute_rollout_costs_once's
+        # perturbed_actions[-1,:,:] = 0. Remove once calibration resumes.
+        self._tick += 1
+        omega = getattr(self.planner, 'omega', None)
+        frac_exceed = self.obj.last_frac_exceed_hard
+        if omega is None:
+            print(f"[mppi_orca diag] tick={self._tick} frac_exceed_hard={frac_exceed} omega=<unset>")
+            return
+        K = omega.shape[0]
+        winning_idx = int(torch.argmax(omega).item())
+        winning_weight = float(omega[winning_idx].item())
+        null_weight = float(omega[K - 1].item())
+        print(f"[mppi_orca diag] tick={self._tick} frac_exceed_hard={frac_exceed} "
+              f"winning_idx={winning_idx}/{K} is_null={winning_idx == K - 1} "
+              f"winning_weight={winning_weight:.4f} null_action_weight={null_weight:.4f}")
 
     def _record_horizon(self, num_humans, states_xy, cost_total):
         # crowd_sim_plus's render() unconditionally reads per-human rows out of
