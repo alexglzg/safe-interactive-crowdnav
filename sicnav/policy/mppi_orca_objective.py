@@ -49,6 +49,23 @@ class MPPIORCAObjective(ObjectiveFunctionsClass):
         self.hard_collision_penalty = cfg["obstacles"].get("hard_collision_penalty", 1e6)
         self.coll_prob_weight = cfg["obstacles"].get("coll_prob_weight", 1000.0)
 
+        # Ablation (b): bypass the Monte Carlo / Gaussian-density CP
+        # estimator entirely and use an exact geometric indicator instead.
+        # A literal small-isotropic_sigma version of the EXISTING estimator
+        # does not behave like a deterministic check: with a fixed
+        # N_monte_carlo=3000 samples drawn uniformly over a multi-square-meter
+        # box, shrinking sigma makes the estimator collapse to high-variance,
+        # almost-always-zero-with-occasional-spikes noise (most samples never
+        # land near an arbitrarily tight Gaussian peak) -- a statistical
+        # failure of the finite-sample MC estimator, not a floating-point
+        # degeneracy, and it would make this ablation misleading rather than
+        # clean. So deterministic_cp bypasses DynamicObstacles/the MC
+        # integral entirely: coll_prob = 1 iff the predicted human mean is
+        # within integral_radius of the robot's own position, using the SAME
+        # integral_radius as the probabilistic path for a fair comparison.
+        self.deterministic_cp = cfg["obstacles"].get("deterministic_cp", False)
+        self.integral_radius = cfg["obstacles"].get("integral_radius", 0.65)
+
         self.rob_radius = 0.0
         self.S = 0
         self.wall_p0 = None
@@ -61,6 +78,11 @@ class MPPIORCAObjective(ObjectiveFunctionsClass):
         self.last_human_cluster_labels = None
         self.last_human_cluster_center_idx = None
         self.last_frac_exceed_hard = None  # diagnostic, see calculate_bound_dyn_cost
+        self.last_coll_prob = None  # diagnostic, see calculate_bound_dyn_cost
+        self.last_soft_cp_only = None  # diagnostic: coll_prob * coll_prob_weight, (C,T), no hard term
+        self.last_goal_cost_full = None  # diagnostic: (K,T)
+        self.last_wall_cost_full = None  # diagnostic: (K,T) or None
+        self.last_soft_cp_broadcast = None  # diagnostic: (K,T) or None
 
         self.set_goal(*cfg["goal"])
 
@@ -100,7 +122,15 @@ class MPPIORCAObjective(ObjectiveFunctionsClass):
         # Copied verbatim from mppi_orca_core/prob_mppi/jackal_objective.py --
         # that class isn't subclassable here because its __init__ hard-requires
         # a global-path spline object this gym doesn't have.
-        if obstacle_modes.ndim == 2:
+        if self.deterministic_cp:
+            # Ablation (b) -- see __init__ comment. obstacle_modes here is
+            # always (C, T, n_humans, 2); self.x/self.y are already narrowed
+            # to the (C, T) representative robot positions by the caller.
+            robot_xy = torch.stack((self.x, self.y), dim=-1).unsqueeze(2)  # (C, T, 1, 2)
+            dist = torch.norm(obstacle_modes - robot_xy, dim=-1)  # (C, T, n_humans)
+            hit = (dist < self.integral_radius).float()
+            coll_prob = 1.0 - torch.prod(1.0 - hit, dim=-1)  # (C, T), union across humans
+        elif obstacle_modes.ndim == 2:
             coll_prob = self.calculate_multi_modal_dynamic_obstacle_cost(obstacle_modes[:, 0], obstacle_modes[:, 1], obstacle_covs, t)
         elif obstacle_modes.ndim == 3:
             coll_prob = self.calculate_multi_modal_dynamic_obstacle_cost(
@@ -116,11 +146,16 @@ class MPPIORCAObjective(ObjectiveFunctionsClass):
         # than wall contact.
         # DIAGNOSTIC (temporary, per user request): fraction of (cluster,
         # timestep) pairs whose predicted collision probability exceeds the
-        # hard threshold -- read back by the policy adapter after command().
+        # hard threshold, and the raw (C,T) CP tensor itself -- read back by
+        # the policy adapter after command().
         self.last_frac_exceed_hard = (coll_prob > self.hard_cp_constraint).float().mean().item()
+        self.last_coll_prob = coll_prob.detach()
+
+        soft_only = coll_prob * self.coll_prob_weight
+        self.last_soft_cp_only = soft_only.detach()
 
         dyn_cost = torch.where(coll_prob > self.hard_cp_constraint, self.hard_collision_penalty, 0.)
-        dyn_cost += coll_prob * self.coll_prob_weight
+        dyn_cost += soft_only
         return dyn_cost
 
     def _wall_cost(self):
@@ -146,11 +181,17 @@ class MPPIORCAObjective(ObjectiveFunctionsClass):
         self.y = state[:, :, 1]
         self.heading = state[:, :, 2]
 
-        total_cost = self.calculate_goal_cost() * self.w_goal  # (K, T)
+        goal_cost = self.calculate_goal_cost() * self.w_goal  # (K, T)
+        total_cost = goal_cost
+        self.last_goal_cost_full = goal_cost.detach()
 
+        self.last_wall_cost_full = None
         if self.wall_p0 is not None:
-            total_cost = total_cost + self._wall_cost()
+            wall_cost = self._wall_cost()
+            total_cost = total_cost + wall_cost
+            self.last_wall_cost_full = wall_cost.detach()
 
+        self.last_soft_cp_broadcast = None
         if predicted_humans is not None and human_cluster_labels is not None and predicted_humans.shape[-2] > 0:
             # Each cluster representative's ORCA prediction is treated as the
             # MEAN of a small Gaussian (orca_cov_scale, fixed -- same role as
@@ -175,6 +216,7 @@ class MPPIORCAObjective(ObjectiveFunctionsClass):
 
             # Broadcast per-cluster cost back out to all K samples.
             total_cost = total_cost + cluster_cost[human_cluster_labels]  # (K, T)
+            self.last_soft_cp_broadcast = self.last_soft_cp_only[human_cluster_labels].detach()  # (K, T)
 
         self.last_predicted_humans = predicted_humans
         self.last_human_cluster_labels = human_cluster_labels

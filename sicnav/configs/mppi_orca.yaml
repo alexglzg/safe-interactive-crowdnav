@@ -62,6 +62,9 @@ obstacles:
   orca_cov_scale: 0.1        # inert in the isotropic MC path we always hit --
                               # see mppi_orca_objective.py __init__ comment;
                               # isotropic_sigma above is the real spread knob.
+  deterministic_cp: false    # ablation (b): bypass the MC/Gaussian CP estimator
+                              # entirely for an exact geometric collision
+                              # indicator -- see mppi_orca_objective.py __init__.
 
 # ORCA parameters for the model this policy has of the humans -- mirrors
 # policy.config's [humans] section (the ORCA assumption SICNav-np/campc uses),

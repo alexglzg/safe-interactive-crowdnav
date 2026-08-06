@@ -97,6 +97,22 @@ def main():
     parser.add_argument('--hallway_static', default=False, action='store_true')
     parser.add_argument('--hallway_bottleneck', default=False, action='store_true')
     parser.add_argument('--hallway_squeeze', default=False, action='store_true')
+    # Diagnostic-only: fixes the policy's own stochastic sampling (MPPI noise
+    # via torch's global RNG) so repeated runs of the same test_case are
+    # reproducible -- the env's own scenario generation (human positions,
+    # v_pref) is already deterministically seeded per test_case
+    # (crowd_sim_plus.py's reset()), this only covers the previously-unseeded
+    # policy side. Not a results protocol -- vary this across repeats and
+    # report that you did; a single seed does not stand in for a distribution.
+    parser.add_argument('--seed', type=int, default=None)
+    # Diagnostic-only override for sweeping mppi_orca's n_clusters without
+    # editing the yaml between runs.
+    parser.add_argument('--mppi_n_clusters', type=int, default=None)
+    # Diagnostic-only: enable mppi_orca_policy.py's per-tick [mppi_orca diag]
+    # / [mppi_orca cost-decomp] / [mppi_orca timing] prints.
+    parser.add_argument('--mppi_orca_diag', default=False, action='store_true')
+    # Ablation (b) override -- see mppi_orca_objective.py's deterministic_cp.
+    parser.add_argument('--mppi_deterministic_cp', default=False, action='store_true')
     args = parser.parse_args()
 
     env_config_file = args.env_config
@@ -156,6 +172,16 @@ def main():
 
     policy.configure(policy_config)
 
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        if hasattr(policy, 'set_seed'):
+            policy.set_seed(args.seed)
+    if args.mppi_n_clusters is not None:
+        policy.cfg['mppi']['n_clusters'] = args.mppi_n_clusters
+    if args.mppi_orca_diag and hasattr(policy, '_diag_enabled'):
+        policy._diag_enabled = True
+    if args.mppi_deterministic_cp and hasattr(policy, 'cfg'):
+        policy.cfg['obstacles']['deterministic_cp'] = True
 
     # make robot and set robot in environment
     if args.policy == 'distnav' or args.policy == 'campc'  and policy.priviledged_info:

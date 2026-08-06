@@ -1,4 +1,5 @@
 import os
+import time
 
 import numpy as np
 import torch
@@ -56,12 +57,23 @@ class MPPIORCAPolicy(Policy):
         self.planner = None
         self.mpc_env = _MpcEnvStub()
         self._tick = 0
+        self._seed = None
+        self._diag_enabled = False  # set True to re-enable the per-tick [mppi_orca diag] prints
         self.all_x_val = []
         self.all_x_goals = []
 
     def configure(self, config):
         with open(CONFIG_PATH) as f:
             self.cfg = yaml.safe_load(f)
+
+    def set_seed(self, seed):
+        # Diagnostic-only (see run_tro.py --seed). Stored, not applied here:
+        # torch's global RNG (MPPI noise) is seeded by the caller directly;
+        # this is read in _lazy_init() to derive a DIFFERENT seed for the
+        # ORCA predictor's own rng, so the uncertainty dial's draws are on a
+        # separate stream from MPPI's noise sampling -- sweeping one must not
+        # perturb the other.
+        self._seed = seed
 
     def _lazy_init(self):
         dt = self.time_step
@@ -85,9 +97,10 @@ class MPPIORCAPolicy(Policy):
 
         self.dyn = UnicycleDynamics(dt, device)
         self.obj = MPPIORCAObjective(full_cfg, device)
+        predictor_seed = (self._seed + 7_919) if self._seed is not None else None
         self.predictor = ORCAPredictor(
             dt=dt, horizon=mppi_cfg['horizon'], orca_params=dict(self.cfg['orca']),
-            device=device, uncertainty=dict(self.cfg['uncertainty']),
+            device=device, uncertainty=dict(self.cfg['uncertainty']), seed=predictor_seed,
         )
         self.planner = MPPIPlanner(
             mppi_cfg,
@@ -123,23 +136,33 @@ class MPPIORCAPolicy(Policy):
         if M > 0:
             self.obj.ensure_dyn_obstacles(self.full_cfg, pos0, vel0)
 
+        t0 = time.perf_counter()
         u, states_xy, cost_total = self.planner.command(robot)
+        solve_ms = (time.perf_counter() - t0) * 1000.0
+        if self._diag_enabled:
+            print(f"[mppi_orca timing] solve_ms={solve_ms:.2f}")
         u = u.detach().cpu().numpy()
 
-        self._log_diagnostics()
+        self._log_diagnostics(states_xy)
 
         self._record_horizon(M, states_xy, cost_total)
 
         return ActionRot(float(u[0]), float(u[1]))
 
-    def _log_diagnostics(self):
+    def _log_diagnostics(self, states_xy):
         # Temporary diagnostic (per user request while debugging frozen-robot
-        # behavior): per tick, fraction of (cluster, timestep) predictions
-        # exceeding hard_cp_constraint, and whether the highest-weighted
-        # sample is the null (braking) action -- index K-1 under
-        # sample_null_action, per _compute_rollout_costs_once's
-        # perturbed_actions[-1,:,:] = 0. Remove once calibration resumes.
+        # / collision behavior): per tick, fraction of (cluster, timestep)
+        # predictions exceeding hard_cp_constraint, whether the
+        # highest-weighted sample is the null (braking) action -- index K-1
+        # under sample_null_action, per _compute_rollout_costs_once's
+        # perturbed_actions[-1,:,:] = 0 -- plus the winning sample's cluster:
+        # its raw CP, its cluster size, and the intra-cluster spread between
+        # the winning sample's OWN trajectory and its cluster representative's
+        # trajectory (the trajectory the CP was actually computed against).
+        # Remove once calibration resumes.
         self._tick += 1
+        if not self._diag_enabled:
+            return
         omega = getattr(self.planner, 'omega', None)
         frac_exceed = self.obj.last_frac_exceed_hard
         if omega is None:
@@ -149,9 +172,43 @@ class MPPIORCAPolicy(Policy):
         winning_idx = int(torch.argmax(omega).item())
         winning_weight = float(omega[winning_idx].item())
         null_weight = float(omega[K - 1].item())
+
+        labels = self.obj.last_human_cluster_labels
+        center_idx = self.obj.last_human_cluster_center_idx
+        coll_prob = self.obj.last_coll_prob
+        if labels is None or coll_prob is None:
+            print(f"[mppi_orca diag] tick={self._tick} frac_exceed_hard={frac_exceed} "
+                  f"winning_idx={winning_idx}/{K} is_null={winning_idx == K - 1} "
+                  f"winning_weight={winning_weight:.4f} null_action_weight={null_weight:.4f} "
+                  f"(no cluster data -- no humans in scene)")
+            return
+
+        cluster = int(labels[winning_idx].item())
+        cluster_size = int((labels == cluster).sum().item())
+        rep_idx = int(center_idx[cluster].item())
+        raw_cp = coll_prob[cluster]  # (T,)
+        spread = torch.norm(states_xy[winning_idx] - states_xy[rep_idx], dim=-1)  # (T,)
+
         print(f"[mppi_orca diag] tick={self._tick} frac_exceed_hard={frac_exceed} "
               f"winning_idx={winning_idx}/{K} is_null={winning_idx == K - 1} "
-              f"winning_weight={winning_weight:.4f} null_action_weight={null_weight:.4f}")
+              f"winning_weight={winning_weight:.4f} null_action_weight={null_weight:.4f} "
+              f"cluster={cluster} cluster_size={cluster_size} rep_idx={rep_idx} "
+              f"raw_cp={[round(v, 4) for v in raw_cp.tolist()]} "
+              f"intra_cluster_spread={[round(v, 4) for v in spread.tolist()]}")
+
+        # Cost decomposition on the winning sample, summed over the horizon
+        # (matching how MPPI actually aggregates: cost_samples = sum over T).
+        goal_full = self.obj.last_goal_cost_full
+        wall_full = self.obj.last_wall_cost_full
+        soft_cp_full = self.obj.last_soft_cp_broadcast
+        goal_sum = float(goal_full[winning_idx].sum().item()) if goal_full is not None else 0.0
+        wall_sum = float(wall_full[winning_idx].sum().item()) if wall_full is not None else 0.0
+        soft_cp_sum = float(soft_cp_full[winning_idx].sum().item()) if soft_cp_full is not None else 0.0
+        denom = goal_sum + wall_sum if (goal_sum + wall_sum) > 1e-9 else float('nan')
+        print(f"[mppi_orca cost-decomp] tick={self._tick} winning_idx={winning_idx} "
+              f"goal_sum={goal_sum:.4f} wall_sum={wall_sum:.4f} soft_cp_sum={soft_cp_sum:.4f} "
+              f"soft_cp/goal={soft_cp_sum / goal_sum if goal_sum > 1e-9 else float('nan'):.3f} "
+              f"soft_cp/(goal+wall)={soft_cp_sum / denom:.3f}")
 
     def _record_horizon(self, num_humans, states_xy, cost_total):
         # crowd_sim_plus's render() unconditionally reads per-human rows out of
